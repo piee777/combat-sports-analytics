@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import time
+import subprocess
 
 import cv2
 import numpy as np
@@ -154,11 +155,15 @@ def process_video(uploaded_file, detection_conf, tracking_conf,
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Output video writer
+    # Output video writer — use XVID codec (widely supported by OpenCV build)
+    tmp_raw = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".avi", dir=tempfile.gettempdir())
+    tmp_raw.close()
     tmp_output = tempfile.NamedTemporaryFile(
         delete=False, suffix=".mp4", dir=tempfile.gettempdir())
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(tmp_output.name, fourcc, fps, (width, height))
+    tmp_output.close()
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    writer = cv2.VideoWriter(tmp_raw.name, fourcc, fps, (width, height))
 
     # Initialise pipeline and analytics
     processor = FighterPoseProcessor(
@@ -209,6 +214,28 @@ def process_video(uploaded_file, detection_conf, tracking_conf,
         processor.close()
 
     progress_bar.progress(1.0, text="Analysis complete!")
+
+    # Re-encode to browser-compatible H.264 MP4 using ffmpeg
+    status_text.caption("Converting to browser-compatible format...")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", tmp_raw.name,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                tmp_output.name,
+            ],
+            check=True, capture_output=True, timeout=300,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        st.error(f"ffmpeg conversion failed: {e}")
+        return None, None
+    finally:
+        # Clean up the raw intermediate file
+        try:
+            os.unlink(tmp_raw.name)
+        except OSError:
+            pass
 
     # Build the analytics DataFrame
     analytics.build_dataframe()
