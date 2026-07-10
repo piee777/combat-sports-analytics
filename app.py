@@ -260,6 +260,28 @@ def render_summary_cards(analytics, fa_name, fb_name):
     c4.metric("Max Strike Speed", f"{s['max_speed']:.2f} m/s")
 
 
+def render_processed_video(video_path):
+    """Render the processed video as a safe sequence of image frames."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        st.error("Unable to load the processed video for playback.")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_slot = st.empty()
+    frame_delay = 1.0 / fps
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_slot.image(frame, channels="BGR")
+            time.sleep(frame_delay)
+    finally:
+        cap.release()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -305,7 +327,7 @@ def main():
         if st.session_state.output_path and os.path.exists(
             st.session_state.output_path
         ):
-            st.video(st.session_state.output_path)
+            render_processed_video(st.session_state.output_path)
 
         st.divider()
         st.header("Summary Statistics")
