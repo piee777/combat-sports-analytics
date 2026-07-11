@@ -546,45 +546,86 @@ with st.sidebar:
 
 
 def process_video(uploaded_file, det_conf, trk_conf, vel_thresh):
-    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=tempfile.gettempdir())
     tmp_in.write(uploaded_file.read())
     tmp_in.close()
+
     cap = cv2.VideoCapture(tmp_in.name)
     if not cap.isOpened():
-        st.error("Failed to open video.")
+        st.error("Failed to open the uploaded video. Please try another file.")
         return None, None
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    writer = cv2.VideoWriter(tmp_out.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+
+    tmp_raw = tempfile.NamedTemporaryFile(delete=False, suffix=".avi", dir=tempfile.gettempdir())
+    tmp_raw.close()
+    tmp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=tempfile.gettempdir())
+    tmp_output.close()
+
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    writer = cv2.VideoWriter(tmp_raw.name, fourcc, fps, (width, height))
+
     processor = FighterPoseProcessor(min_detection_confidence=det_conf, min_tracking_confidence=trk_conf)
     analytics = FightAnalytics(fps=fps)
     import config
     config.VELOCITY_THRESHOLD = vel_thresh / 100.0
-    prog = st.progress(0, text="Starting analysis...")
-    fc = 0
+
+    progress_bar = st.progress(0, text="Starting analysis...")
+    status_text = st.empty()
+    frame_count = 0
+
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            ann, mets = processor.process_frame(frame, timestamp_ms=int(fc * 1000 / fps))
-            writer.write(ann)
-            analytics.record_frame(fc, mets)
-            fc += 1
-            if fc % 5 == 0 or fc == total:
-                prog.progress(min(fc / total, 1.0), text=f"Frame {fc}/{total}")
+            annotated, metrics = processor.process_frame(frame, timestamp_ms=int(frame_count * 1000 / fps))
+            writer.write(annotated)
+            analytics.record_frame(frame_count, metrics)
+            frame_count += 1
+            if frame_count % 5 == 0 or frame_count == total_frames or total_frames == 0:
+                pct = frame_count / total_frames if total_frames else 0.0
+                progress_bar.progress(min(pct, 1.0), text=f"Processing frame {frame_count}/{total_frames or '?'}")
+                status_text.caption(f"Elapsed: {frame_count / fps:.1f}s / {total_frames / fps:.1f}s video")
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Processing error: {e}")
     finally:
         cap.release()
         writer.release()
         processor.close()
-    prog.progress(1.0, text="Done!")
+
+    progress_bar.progress(1.0, text="Analysis complete!")
+    status_text.caption("Preparing the processed video for playback...")
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", tmp_raw.name,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                tmp_output.name,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        try:
+            os.replace(tmp_raw.name, tmp_output.name)
+        except OSError:
+            pass
+    finally:
+        try:
+            if os.path.exists(tmp_raw.name):
+                os.unlink(tmp_raw.name)
+        except OSError:
+            pass
+
     analytics.build_dataframe()
-    return tmp_out.name, analytics
+    return tmp_output.name, analytics
 
 
 def render_processed_video(video_path):
