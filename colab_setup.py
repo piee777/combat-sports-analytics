@@ -494,7 +494,7 @@ print("Written: analytics.py")
 app_code = r'''
 """Combat Sports Video Analytics - Main Streamlit Application."""
 
-import os, sys, tempfile
+import os, sys, tempfile, time
 import cv2, numpy as np
 import streamlit as st
 
@@ -587,6 +587,28 @@ def process_video(uploaded_file, det_conf, trk_conf, vel_thresh):
     return tmp_out.name, analytics
 
 
+def render_processed_video(video_path):
+    """Render the processed video as a safe sequence of image frames."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        st.error("Unable to load the processed video for playback.")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    frame_slot = st.empty()
+    frame_delay = 1.0 / fps
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_slot.image(frame, channels="BGR")
+            time.sleep(frame_delay)
+    finally:
+        cap.release()
+
+
 st.markdown("# Combat Sports Video Analytics")
 st.markdown("Upload a fight video, process it with real-time pose tracking, and explore fight analytics.")
 
@@ -610,7 +632,7 @@ if st.session_state.processing_done and st.session_state.analytics:
     st.divider()
     st.header("Processed Video")
     if st.session_state.output_path and os.path.exists(st.session_state.output_path):
-        st.video(st.session_state.output_path)
+        render_processed_video(st.session_state.output_path)
     st.divider()
     st.header("Summary Statistics")
     c1, c2, c3, c4 = st.columns(4)
