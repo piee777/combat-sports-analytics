@@ -11,9 +11,19 @@ import cv2
 # ---------------------------------------------------------------------------
 # MediaPipe Pose Detection Parameters
 # ---------------------------------------------------------------------------
-MODEL_COMPLEXITY = 1
+# MODEL_COMPLEXITY: 0 = lite (fastest), 1 = full, 2 = heavy (slowest)
+# On low-end CPUs (Pentium, Celeron, Core 2), use 0
+MODEL_COMPLEXITY = 0
 MIN_DETECTION_CONFIDENCE = 0.5
 MIN_TRACKING_CONFIDENCE = 0.5
+
+# ---------------------------------------------------------------------------
+# Performance limits (critical for low-end PCs)
+# ---------------------------------------------------------------------------
+# Max width to process frames at (downscale before MediaPipe)
+PROCESS_MAX_WIDTH = 480
+# Skip every Nth frame for pose detection (1 = every frame, 2 = every other)
+SKIP_FRAMES = 2
 
 # ---------------------------------------------------------------------------
 # Fighter Visual Identity (BGR color space for OpenCV)
@@ -108,6 +118,18 @@ HOOK_MIN_ANGLE = 45.0       # Curved / angular trajectory
 # ---------------------------------------------------------------------------
 PLOTLY_TEMPLATE = "plotly_dark"
 CHART_HEIGHT = 350
+PLOTLY_CONFIG = {
+    "displayModeBar": False,
+    "displaylogo": False,
+    "staticPlot": False,
+}
 
 FIGHTER_A_CHART_COLOR = "#3B82F6"   # Blue (hex for Plotly)
 FIGHTER_B_CHART_COLOR = "#EF4444"   # Red  (hex for Plotly)
+
+# ---------------------------------------------------------------------------
+# Annotation Toggles (set dynamically by Gradio UI)
+# ---------------------------------------------------------------------------
+SHOW_SKELETON = True
+SHOW_BBOX = True
+SHOW_METRICS = True

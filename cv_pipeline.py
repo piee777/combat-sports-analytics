@@ -26,6 +26,8 @@ from config import (
     LANDMARKS,
     LS, RS, LE, RE, LW, RW, LH, RH, LK, RK, LA, RA,
     VELOCITY_SMOOTH_WINDOW,
+    PROCESS_MAX_WIDTH,
+    SKIP_FRAMES,
 )
 
 # Default path to the PoseLandmarker .task model file (lite variant)
@@ -126,6 +128,11 @@ class FighterPoseProcessor:
         self._prev_wrist_b = None
         self._velocity_history_a: list[float] = []
         self._velocity_history_b: list[float] = []
+
+        # Frame skipping state
+        self._frame_count = 0
+        self._last_annotated = None
+        self._last_metrics = None
 
     # ------------------------------------------------------------------
     # Internal drawing helpers
@@ -238,6 +245,29 @@ class FighterPoseProcessor:
         metrics : dict
             Per-fighter metrics (see module docstring).
         """
+        self._frame_count += 1
+        orig_h, orig_w = frame.shape[:2]
+
+        # Downscale for faster processing on low-end CPUs
+        scale = 1.0
+        if orig_w > PROCESS_MAX_WIDTH:
+            scale = PROCESS_MAX_WIDTH / orig_w
+            frame = cv2.resize(frame, None, fx=scale, fy=scale,
+                               interpolation=cv2.INTER_AREA)
+
+        # Skip frames for performance: reuse last result
+        if SKIP_FRAMES > 1 and self._frame_count % SKIP_FRAMES != 0:
+            if self._last_annotated is not None:
+                # Scale back up for display
+                display = self._last_annotated
+                if scale < 1.0:
+                    display = cv2.resize(display, (orig_w, orig_h),
+                                         interpolation=cv2.INTER_LINEAR)
+                return display, self._last_metrics
+            # First frame can't be skipped
+            scale = 1.0
+            frame = cv2.resize(frame, None, fx=1/scale, fy=1/scale) if scale != 1.0 else frame
+
         h, w = frame.shape[:2]
         annotated = frame.copy()
 
@@ -338,6 +368,16 @@ class FighterPoseProcessor:
                 "bounding_box": bb_b,
             },
         }
+
+        # Scale back up to original resolution for display
+        if scale < 1.0:
+            annotated = cv2.resize(annotated, (orig_w, orig_h),
+                                   interpolation=cv2.INTER_LINEAR)
+
+        # Cache for frame skipping
+        self._last_annotated = annotated
+        self._last_metrics = metrics
+
         return annotated, metrics
 
     # ------------------------------------------------------------------
