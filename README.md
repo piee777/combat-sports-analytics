@@ -5,7 +5,7 @@
 [![MediaPipe](https://img.shields.io/badge/MediaPipe-0.10%2B-green)](https://mediapipe.dev)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-AI-powered analysis for boxing and MMA footage. Upload a fight video (or paste a URL), and get real-time pose tracking, strike detection, round-by-round breakdowns, and interactive analytics — all through a browser interface.
+ Upload a fight video (or paste a URL), and get real-time pose tracking, strike detection, round-by-round breakdowns, and interactive analytics — all through a browser interface.
 
 ---
 
