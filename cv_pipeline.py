@@ -85,8 +85,9 @@ class FighterPoseProcessor:
     Detects poses for up to two fighters in a single frame using the
     MediaPipe PoseLandmarker Tasks API with ``num_poses=2``.
 
-    Detected poses are assigned to Fighter A (leftmost) and Fighter B
-    (rightmost) based on their horizontal centre of mass.
+    Detected poses are assigned to Fighter A and Fighter B using
+    nearest-centroid tracking across frames, so identities remain
+    consistent even when fighters cross or move quickly.
 
     Per-fighter state (previous wrist positions, velocity history) is
     maintained across frames for velocity and strike tracking.
@@ -128,6 +129,8 @@ class FighterPoseProcessor:
         self._prev_wrist_b = None
         self._velocity_history_a: list[float] = []
         self._velocity_history_b: list[float] = []
+        self._prev_centroid_a: tuple[float, float] | None = None
+        self._prev_centroid_b: tuple[float, float] | None = None
 
         # Frame skipping state
         self._frame_count = 0
@@ -138,41 +141,70 @@ class FighterPoseProcessor:
     # Internal drawing helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _assign_fighters(all_poses_px):
+    def _assign_fighters(self, all_poses_px, frame_width):
         """
-        Given a list of detected pose landmark sets (each a list of
-        33 pixel-coordinate tuples), assign the leftmost pose to
-        Fighter A and the rightmost to Fighter B.
-
-        Returns
-        -------
-        (pose_a, pose_b) : tuple
-            Each element is either a list of 33 (x, y) tuples or None.
+        Assign poses to Fighter A / Fighter B using nearest-centroid
+        tracking across frames. On the first frame, falls back to
+        left/right assignment. On subsequent frames, each pose is
+        matched to the closest previous centroid, maintaining identity
+        even when fighters cross.
         """
         if not all_poses_px:
-            return None, None
-        if len(all_poses_px) == 1:
-            # Assign based on horizontal position relative to frame centre
-            pose = all_poses_px[0]
-            valid = [p for p in pose if p is not None]
-            if valid:
-                cx = np.mean([p[0] for p in valid])
-                # We don't know frame width here, use 0.5 as proxy
-                if cx < 0.5 * 1000:  # will be compared in process_frame
-                    return pose, None
-                else:
-                    return None, pose
+            self._prev_centroid_a = None
+            self._prev_centroid_b = None
             return None, None
 
-        # Two poses: sort by horizontal centre
-        centres = []
+        # Compute centroid for each detected pose
+        centroids = []
         for pose in all_poses_px:
             valid = [p for p in pose if p is not None]
-            cx = np.mean([p[0] for p in valid]) if valid else float("inf")
-            centres.append(cx)
-        order = np.argsort(centres)
-        return all_poses_px[order[0]], all_poses_px[order[1]]
+            if valid:
+                cx = float(np.mean([p[0] for p in valid]))
+                cy = float(np.mean([p[1] for p in valid]))
+            else:
+                cx, cy = float("inf"), float("inf")
+            centroids.append((cx, cy, pose))
+
+        if len(centroids) == 1:
+            cx, cy, pose = centroids[0]
+            if self._prev_centroid_a is not None and self._prev_centroid_b is not None:
+                da = np.hypot(cx - self._prev_centroid_a[0], cy - self._prev_centroid_a[1])
+                db = np.hypot(cx - self._prev_centroid_b[0], cy - self._prev_centroid_b[1])
+                if db < da:
+                    self._prev_centroid_b = (cx, cy)
+                    return None, pose
+                self._prev_centroid_a = (cx, cy)
+                return pose, None
+            # First frame: assign by left/right
+            self._prev_centroid_a = (cx, cy)
+            return (pose, None) if cx < frame_width / 2 else (None, pose)
+
+        # Two poses: match each to closest previous centroid
+        c0 = (centroids[0][0], centroids[0][1])
+        c1 = (centroids[1][0], centroids[1][1])
+
+        if self._prev_centroid_a is None or self._prev_centroid_b is None:
+            # First frame: leftmost = A, rightmost = B
+            if c0[0] < c1[0]:
+                self._prev_centroid_a = c0
+                self._prev_centroid_b = c1
+                return centroids[0][2], centroids[1][2]
+            else:
+                self._prev_centroid_a = c1
+                self._prev_centroid_b = c0
+                return centroids[1][2], centroids[0][2]
+
+        da0 = np.hypot(c0[0] - self._prev_centroid_a[0], c0[1] - self._prev_centroid_a[1])
+        da1 = np.hypot(c1[0] - self._prev_centroid_a[0], c1[1] - self._prev_centroid_a[1])
+
+        if da0 <= da1:
+            self._prev_centroid_a = c0
+            self._prev_centroid_b = c1
+            return centroids[0][2], centroids[1][2]
+        else:
+            self._prev_centroid_a = c1
+            self._prev_centroid_b = c0
+            return centroids[1][2], centroids[0][2]
 
     def _draw_skeleton_on_frame(self, frame, landmarks_px, color):
         """Draw connections and landmarks on *frame* using *color* (BGR)."""
@@ -282,8 +314,8 @@ class FighterPoseProcessor:
             px = get_all_landmarks_px(pose_landmarks, w, h)
             all_poses_px.append(px)
 
-        # Assign to Fighter A (left) / Fighter B (right)
-        px_a, px_b = self._assign_fighters_with_width(all_poses_px, w)
+        # Assign to Fighter A / Fighter B (nearest-centroid tracking)
+        px_a, px_b = self._assign_fighters(all_poses_px, w)
 
         # ---- Per-fighter metrics ----
         def _compute_fighter_metrics(px, prev_wrist, vel_history):
@@ -377,33 +409,6 @@ class FighterPoseProcessor:
         self._last_metrics = metrics
 
         return annotated, metrics
-
-    # ------------------------------------------------------------------
-    # Assignment helper with frame width
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _assign_fighters_with_width(all_poses_px, frame_width):
-        """Assign poses to Fighter A (left) / Fighter B (right) using frame width."""
-        if not all_poses_px:
-            return None, None
-        if len(all_poses_px) == 1:
-            pose = all_poses_px[0]
-            valid = [p for p in pose if p is not None]
-            if valid:
-                cx = np.mean([p[0] for p in valid])
-                if cx < frame_width / 2:
-                    return pose, None
-                return None, pose
-            return None, None
-
-        centres = []
-        for pose in all_poses_px:
-            valid = [p for p in pose if p is not None]
-            cx = np.mean([p[0] for p in valid]) if valid else float("inf")
-            centres.append(cx)
-        order = np.argsort(centres)
-        return all_poses_px[order[0]], all_poses_px[order[1]]
 
     def close(self):
         """Release MediaPipe resources."""
