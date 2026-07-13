@@ -6,8 +6,10 @@ Opens on http://localhost:7860
 
 Features:
   - Upload video or paste URL (YouTube, UFC, etc.)
-  - Real-time MediaPipe 2-person pose tracking
+  - MediaPipe 2-person pose tracking
   - Strike detection & classification (Jab/Cross/Hook)
+  - Quality selector (Ultra Fast/Low/Medium/High/Maximum)
+  - Target FPS output (downsample video for speed)
   - Round-by-round analysis
   - Strike combination detection
   - Fighter scorecard
@@ -24,6 +26,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 
 import cv2
 import gradio as gr
@@ -40,10 +43,6 @@ from config import (
 from cv_pipeline import FighterPoseProcessor
 from analytics import FightAnalytics
 
-
-# ---------------------------------------------------------------------------
-# Custom CSS
-# ---------------------------------------------------------------------------
 
 CUSTOM_CSS = """
 .main-title { text-align: center; margin-bottom: 0.5em; }
@@ -62,10 +61,14 @@ CUSTOM_CSS = """
 .kpi-sub { font-size: 0.82em; color: #64748b; }
 """
 
+QUALITY_PRESETS = {
+    "Ultra Fast": (25, 240),
+    "Low": (10, 240),
+    "Medium": (5, 320),
+    "High": (2, 480),
+    "Maximum": (1, 640),
+}
 
-# ---------------------------------------------------------------------------
-# URL Download
-# ---------------------------------------------------------------------------
 
 def download_video_from_url(url):
     """Download video from URL using yt-dlp. Returns (path, title, duration)."""
@@ -113,10 +116,6 @@ def handle_url_download(url):
         raise gr.Error(f"Download failed: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Core Processing
-# ---------------------------------------------------------------------------
-
 def process_video(
     video_path,
     fighter_a_name,
@@ -128,9 +127,11 @@ def process_video(
     show_bbox,
     show_metrics_flag,
     round_duration_sec,
+    quality,
+    target_fps,
     progress=gr.Progress(),
 ):
-    """Full video processing pipeline with annotation controls."""
+    """Process video and produce annotated output with play/pause/seek video player."""
     if video_path is None:
         raise gr.Error("Please upload a video or provide a URL first.")
 
@@ -143,13 +144,25 @@ def process_video(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
+    skip_frames, process_max_width = QUALITY_PRESETS.get(quality, (5, 320))
+
+    out_fps = min(target_fps, fps)
+    frame_step = max(1, round(fps / out_fps))
+
+    import config as cfg
+    cfg.SKIP_FRAMES = skip_frames
+    cfg.PROCESS_MAX_WIDTH = process_max_width
+    cfg.VELOCITY_THRESHOLD = velocity_thresh / 100.0
+    cfg.FIGHTER_A_NAME = fighter_a_name
+    cfg.FIGHTER_B_NAME = fighter_b_name
+
     tmp_raw = tempfile.NamedTemporaryFile(delete=False, suffix=".avi")
     tmp_raw.close()
     tmp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp_output.close()
 
     fourcc = cv2.VideoWriter_fourcc(*"XVID")
-    writer = cv2.VideoWriter(tmp_raw.name, fourcc, fps, (width, height))
+    writer = cv2.VideoWriter(tmp_raw.name, fourcc, out_fps, (width, height))
 
     processor = FighterPoseProcessor(
         min_detection_confidence=detection_conf,
@@ -157,24 +170,21 @@ def process_video(
     )
     analytics = FightAnalytics(fps=fps)
 
-    import config
-    config.VELOCITY_THRESHOLD = velocity_thresh / 100.0
-
-    # Update fighter names in config
-    config.FIGHTER_A_NAME = fighter_a_name
-    config.FIGHTER_B_NAME = fighter_b_name
-
     frame_count = 0
+    start_time = time.time()
+
+    progress(0, desc="Starting...")
+
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+
             annotated, metrics = processor.process_frame(
                 frame, timestamp_ms=int(frame_count * 1000 / fps)
             )
 
-            # Apply annotation toggles
             if not (show_skeleton and show_bbox and show_metrics_flag):
                 annotated = _apply_annotation_toggles(
                     frame.copy(), processor, metrics,
@@ -182,18 +192,21 @@ def process_video(
                     fighter_a_name, fighter_b_name,
                 )
 
-            writer.write(annotated)
+            if frame_count % frame_step == 0:
+                writer.write(annotated)
+
             analytics.record_frame(frame_count, metrics)
             frame_count += 1
 
-            # Yield real-time preview frame
-            preview = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-            yield (preview,) + (gr.skip(),) * 23
+            if frame_count % 30 == 0 and total_frames > 0:
+                elapsed = time.time() - start_time
+                rate = frame_count / elapsed if elapsed > 0 else 0
+                remaining = (total_frames - frame_count) / rate if rate > 0 else 0
+                progress(
+                    frame_count / total_frames,
+                    desc=f"Analyzing {frame_count}/{total_frames} ({remaining:.0f}s remain)",
+                )
 
-            if total_frames > 0:
-                progress(frame_count / total_frames, desc=f"Frame {frame_count}/{total_frames}")
-            elif frame_count % 30 == 0:
-                progress(0.5, desc=f"Processed {frame_count} frames...")
     except Exception as e:
         raise gr.Error(f"Processing error: {e}")
     finally:
@@ -201,7 +214,11 @@ def process_video(
         writer.release()
         processor.close()
 
-    # Convert to browser-compatible format
+    if frame_count == 0:
+        raise gr.Error("No frames to process.")
+
+    progress(0.95, desc="Encoding video...")
+
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-i", tmp_raw.name,
@@ -221,11 +238,12 @@ def process_video(
         except OSError:
             pass
 
+    progress(0.98, desc="Building stats...")
+
     analytics.build_dataframe()
     s = analytics.summary
     fa, fb = fighter_a_name, fighter_b_name
 
-    # ---- KPI Summary Cards (HTML) ----
     kpi_html = f"""
 <div class="kpi-row">
     <div class="kpi-card">
@@ -256,19 +274,17 @@ def process_video(
 </div>
 """
 
-    # ---- Summary Markdown ----
     acc_a = round(s['fighter_a_landed'] / max(s['fighter_a_total_strikes'], 1) * 100, 1)
     acc_b = round(s['fighter_b_landed'] / max(s['fighter_b_total_strikes'], 1) * 100, 1)
-    avg_spd_a = 0.0
-    avg_spd_b = 0.0
+    avg_spd_a = avg_spd_b = 0.0
     if analytics.df is not None:
-        spd_a_vals = analytics.df["fighter_a_wrist_speed"].dropna()
-        spd_b_vals = analytics.df["fighter_b_wrist_speed"].dropna()
-        avg_spd_a = float(spd_a_vals.mean()) if len(spd_a_vals) > 0 else 0.0
-        avg_spd_b = float(spd_b_vals.mean()) if len(spd_b_vals) > 0 else 0.0
+        spd_a = analytics.df["fighter_a_wrist_speed"].dropna()
+        spd_b = analytics.df["fighter_b_wrist_speed"].dropna()
+        avg_spd_a = float(spd_a.mean()) if len(spd_a) > 0 else 0.0
+        avg_spd_b = float(spd_b.mean()) if len(spd_b) > 0 else 0.0
 
     summary_md = f"""
-## Detailed Summary
+## Summary
 
 | Metric | {fa} | {fb} |
 |--------|------|------|
@@ -285,7 +301,6 @@ def process_video(
 - **Fight Duration:** {s['fight_duration_sec']:.1f}s
 """
 
-    # ---- Charts ----
     bar_chart = analytics.render_punches_bar()
     gauge_chart = analytics.render_max_speed_gauge()
     radar_chart = analytics.render_radar_comparison()
@@ -300,19 +315,15 @@ def process_video(
     activity_heatmap = analytics.render_activity_heatmap()
     round_chart_fig = analytics.render_round_chart(round_duration_sec)
 
-    # ---- Strike Log ----
     strike_log = analytics.get_strike_log()
     strike_log_df = pd.DataFrame(strike_log) if strike_log else pd.DataFrame()
 
-    # ---- Combinations ----
     combos = analytics.get_combinations()
     combos_df = pd.DataFrame(combos) if combos else pd.DataFrame()
 
-    # ---- Scorecard ----
     scorecard = analytics.get_scorecard()
     scorecard_md = _format_scorecard(scorecard, fa, fb)
 
-    # ---- Export Data ----
     display_cols = [
         "frame", "timestamp_sec",
         "fighter_a_detected", "fighter_a_wrist_speed",
@@ -330,8 +341,9 @@ def process_video(
     with open(json_path, "w") as f:
         json.dump(s, f, indent=2)
 
+    progress(1.0, desc="Done! Play the annotated video below.")
+
     yield (
-        None,  # clear live preview
         tmp_output.name,
         kpi_html,
         summary_md,
@@ -357,10 +369,6 @@ def process_video(
         tmp_output.name,
     )
 
-
-# ---------------------------------------------------------------------------
-# Annotation Toggle Helper
-# ---------------------------------------------------------------------------
 
 def _apply_annotation_toggles(frame, processor, metrics,
                                show_skeleton, show_bbox, show_metrics,
@@ -392,10 +400,6 @@ def _apply_annotation_toggles(frame, processor, metrics,
     return result
 
 
-# ---------------------------------------------------------------------------
-# Scorecard Formatter
-# ---------------------------------------------------------------------------
-
 def _format_scorecard(card, fa, fb):
     """Format the scorecard as a markdown table."""
     if not card or "_totals" not in card:
@@ -423,20 +427,38 @@ def _format_scorecard(card, fa, fb):
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Gradio UI
-# ---------------------------------------------------------------------------
+_live_processor: FighterPoseProcessor | None = None
+
+
+def get_live_processor():
+    global _live_processor
+    if _live_processor is None:
+        _live_processor = FighterPoseProcessor(
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+    return _live_processor
+
+
+def process_live_frame(frame_rgb):
+    if frame_rgb is None:
+        return None
+    proc = get_live_processor()
+    bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    annotated, _ = proc.process_frame(bgr, timestamp_ms=0)
+    rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+    return rgb
+
 
 with gr.Blocks(title="Combat Sports Analytics") as demo:
     gr.HTML(f"<style>{CUSTOM_CSS}</style>")
     gr.HTML("""
     <div class="main-title">
         <h1>Combat Sports Video Analytics</h1>
-        <p>AI-powered fight analysis with real-time pose tracking, strike detection, and interactive charts.</p>
+        <p>Upload a fight video or paste a URL. Get an annotated replay with pose tracking, strike detection, and full stats.</p>
     </div>
     """)
 
-    # ---- Input Section ----
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### Video Input")
@@ -467,7 +489,18 @@ with gr.Blocks(title="Combat Sports Analytics") as demo:
             show_bbox = gr.Checkbox(label="Show Bounding Boxes", value=True)
             show_metrics = gr.Checkbox(label="Show Metric Overlays", value=True)
 
-            gr.Markdown("### Round Settings")
+            gr.Markdown("### Output Settings")
+            target_fps = gr.Slider(
+                1, 60, value=25, step=1,
+                label="Output FPS",
+                info="Lower = faster processing (25 is standard)",
+            )
+            quality = gr.Radio(
+                choices=["Ultra Fast", "Low", "Medium", "High", "Maximum"],
+                value="Maximum",
+                label="Pose Detection Quality",
+                info="Maximum = every frame analyzed",
+            )
             round_duration = gr.Slider(
                 60, 600, value=180, step=30,
                 label="Round Duration (seconds)",
@@ -476,11 +509,12 @@ with gr.Blocks(title="Combat Sports Analytics") as demo:
 
     process_btn = gr.Button("Analyze Video", variant="primary", size="lg")
 
-    # ---- Output Tabs ----
     with gr.Tabs():
-        with gr.Tab("Summary"):
-            output_video = gr.Video(label="Annotated Video", height=400)
-            live_preview = gr.Image(label="Live Processing Preview", height=400)
+        with gr.Tab("Annotated Video"):
+            output_video = gr.Video(label="Annotated Fight Video", height=450)
+            gr.Markdown("*Use player controls to play, pause, seek, and adjust speed.*")
+
+        with gr.Tab("Summary Stats"):
             kpi_html = gr.HTML()
             summary_md = gr.Markdown()
 
@@ -527,7 +561,17 @@ with gr.Blocks(title="Combat Sports Analytics") as demo:
                 json_file = gr.File(label="Download JSON Summary")
             video_download = gr.File(label="Download Processed Video")
 
-    # ---- Event Wiring ----
+        with gr.Tab("Live Webcam"):
+            gr.Markdown("### Real-time Pose Tracking (Webcam)")
+            gr.Markdown("Point your webcam at fighters to see live pose skeleton, speed, and guard angle.")
+            with gr.Row():
+                live_webcam = gr.Image(sources=["webcam"], streaming=True, label="Webcam Input", height=400)
+                live_output = gr.Image(label="Pose Detection", height=400)
+            live_webcam.stream(
+                fn=process_live_frame,
+                inputs=live_webcam,
+                outputs=live_output,
+            )
 
     def resolve_video_input(video_from_upload, url_path):
         if video_from_upload is not None:
@@ -543,36 +587,46 @@ with gr.Blocks(title="Combat Sports Analytics") as demo:
     )
 
     def run_analysis(video_upload, url_path, fa, fb, det, trk, vel,
-                     skel, bbox, metrics_flag, round_dur):
+                     skel, bbox, metrics_flag, quality, round_dur, out_fps):
         video = resolve_video_input(video_upload, url_path)
         if video is None:
             raise gr.Error("Please upload a video or download from a URL first.")
 
         yield from process_video(
             video, fa, fb, det, trk, vel,
-            skel, bbox, metrics_flag, round_dur,
+            skel, bbox, metrics_flag, round_dur, quality, out_fps,
         )
 
-    process_btn.click(
+    analysis_inputs = [
+        video_input, url_video_path,
+        fa_name_input, fb_name_input,
+        det_conf, trk_conf, vel_thresh,
+        show_skeleton, show_bbox, show_metrics,
+        quality, round_duration, target_fps,
+    ]
+    analysis_outputs = [
+        output_video,
+        kpi_html, summary_md,
+        bar_chart, gauge_chart, radar_chart, pie_chart,
+        velocity_chart, guard_chart,
+        strike_timeline, cumulative_chart, heatmap_chart,
+        elbow_chart, knee_chart, activity_heatmap,
+        round_chart, scorecard_md,
+        strike_log_table, combos_table,
+        dataframe, csv_file, json_file, video_download,
+    ]
+
+    process_btn.click(fn=run_analysis, inputs=analysis_inputs, outputs=analysis_outputs)
+
+    video_input.change(
         fn=run_analysis,
-        inputs=[
-            video_input, url_video_path,
-            fa_name_input, fb_name_input,
-            det_conf, trk_conf, vel_thresh,
-            show_skeleton, show_bbox, show_metrics,
-            round_duration,
-        ],
-        outputs=[
-            live_preview,
-            output_video, kpi_html, summary_md,
-            bar_chart, gauge_chart, radar_chart, pie_chart,
-            velocity_chart, guard_chart,
-            strike_timeline, cumulative_chart, heatmap_chart,
-            elbow_chart, knee_chart, activity_heatmap,
-            round_chart, scorecard_md,
-            strike_log_table, combos_table,
-            dataframe, csv_file, json_file, video_download,
-        ],
+        inputs=analysis_inputs,
+        outputs=analysis_outputs,
+    )
+    url_video_path.change(
+        fn=run_analysis,
+        inputs=analysis_inputs,
+        outputs=analysis_outputs,
     )
 
 

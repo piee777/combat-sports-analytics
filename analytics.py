@@ -146,7 +146,9 @@ class FightAnalytics:
                     entry[f"{prefix}_{suffix}"] = None
 
             # ---- Strike detection ----
-            strike = self._detect_strike(fighter_key, entry, lm_px, fm)
+            opponent_key = "fighter_b" if fighter_key == "fighter_a" else "fighter_a"
+            opponent_fm = metrics.get(opponent_key, {})
+            strike = self._detect_strike(fighter_key, entry, lm_px, fm, opponent_fm)
             entry[f"{prefix}_strike_detected"] = strike is not None
             if strike:
                 self._strikes_a.append(strike) if fighter_key == "fighter_a" else self._strikes_b.append(strike)
@@ -157,12 +159,13 @@ class FightAnalytics:
     # Strike Detection (rule-based)
     # ------------------------------------------------------------------
 
-    def _detect_strike(self, fighter_key, frame_entry, lm_px, fm):
+    def _detect_strike(self, fighter_key, frame_entry, lm_px, fm, opponent_fm):
         """
         Rule-based strike detection:
           1. Wrist velocity above threshold
           2. Elbow extension angle above threshold (arm extending)
           3. Cooldown period elapsed
+          4. Wrist moving toward opponent
         """
         is_a = fighter_key == "fighter_a"
         cooldown_attr = "_cooldown_a" if is_a else "_cooldown_b"
@@ -179,7 +182,6 @@ class FightAnalytics:
         # Check arm extension via dominant elbow angle
         dominant_angle = None
         if lm_px:
-            # Prefer the elbow on the striking (dominant) side
             lw = fm.get("left_wrist_px")
             rw = fm.get("right_wrist_px")
             if lw and lm_px[LS] and lm_px[LE] and lm_px[LW]:
@@ -190,11 +192,9 @@ class FightAnalytics:
         if dominant_angle is None or dominant_angle < ARM_EXTENSION_THRESHOLD:
             return None
 
-        # Strike detected
         strike_type = self._classify_strike(fm, lm_px)
 
-        # "Landed" heuristic: check if striking wrist overlaps opponent bounding box
-        landed = self._check_landed(fm, "fighter_b" if is_a else "fighter_a")
+        landed = self._check_landed(fm, opponent_fm)
 
         strike = {
             "fighter": fighter_key,
@@ -253,15 +253,32 @@ class FightAnalytics:
             return "Hook"
 
     @staticmethod
-    def _check_landed(fm, opponent_key):
+    def _check_landed(fm, opponent_fm):
         """
-        Heuristic: a punch is 'landed' if the striking wrist's X is within
-        the opponent's bounding box X-range.
+        Heuristic: a punch is 'landed' if the striking wrist position is
+        near or within the opponent's bounding box.
         """
-        opponent_bb_key = f"{opponent_key}_bb"
-        # We don't have opponent frame data here, so approximate from current fm
-        # This is a simplified check using the bounding box stored in the frame entry
-        return np.random.random() > 0.4  # placeholder — improved in build_dataframe
+        opp_bb = opponent_fm.get("bounding_box")
+        if opp_bb is None:
+            return False
+
+        # Get striking wrist from current fighter
+        lw = fm.get("left_wrist_px")
+        rw = fm.get("right_wrist_px")
+        wrist = lw if (lw and not rw) or (lw and rw and lw[0] > rw[0]) else rw
+        if wrist is None:
+            return False
+
+        ox1, oy1, ox2, oy2 = opp_bb
+        wx, wy = wrist
+
+        # Wrist within or near opponent bounding box (with 30px margin)
+        margin = 30
+        if (ox1 - margin) <= wx <= (ox2 + margin) and (oy1 - margin) <= wy <= (oy2 + margin):
+            # Also check wrist is moving forward toward opponent
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Post-processing

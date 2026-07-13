@@ -213,16 +213,14 @@ class FighterPoseProcessor:
                          guard_angle, wrist_speed):
         """Real-time metric text overlay."""
         overlay = frame.copy()
-        cv2.rectangle(overlay, (8, y_offset - 18), (280, y_offset + 38),
+        cv2.rectangle(overlay, (4, y_offset - 10), (155, y_offset + 22),
                       (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
-        cv2.putText(frame, label, (12, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-        cv2.putText(frame, f"Speed: {wrist_speed:.2f} m/s", (12, y_offset + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        cv2.putText(frame, f"Guard: {guard_angle:.1f} deg", (12, y_offset + 34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(frame, label, (6, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+        cv2.putText(frame, f"S:{wrist_speed:.1f} G:{guard_angle:.0f}", (6, y_offset + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
     # ------------------------------------------------------------------
     # Main public method
